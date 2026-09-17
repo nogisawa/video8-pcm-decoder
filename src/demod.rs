@@ -188,6 +188,7 @@ pub fn scan_window_gated(
         phases,
         gate_threshold,
         workers,
+        false,
     )
 }
 
@@ -199,6 +200,7 @@ pub fn scan_window_gated_with_workers(
     phases: usize,
     gate_threshold: f64,
     workers: usize,
+    stop_after_field_lock: bool,
 ) -> (Vec<f64>, Vec<Candidate>) {
     if gate_threshold > 0.0 && activity_ratio(input) < gate_threshold {
         return (Vec::new(), Vec::new());
@@ -212,9 +214,30 @@ pub fn scan_window_gated_with_workers(
             let filtered = &filtered;
             handles.push(scope.spawn(move || {
                 let mut local = Vec::new();
+                let mut phases_after_lock = None::<usize>;
                 for phase_index in (worker..phases).step_by(workers) {
                     let phase = phase_index as f64 * spb / phases as f64;
                     local.extend(scan_phase(filtered, absolute_start, spb, phase));
+                    if let Some(remaining) = phases_after_lock {
+                        // A couple of additional phases supply CRC-valid blocks that
+                        // are marginal at the lock phase, while still avoiding
+                        // the remaining exhaustive phase scans.
+                        if remaining == 1 {
+                            break;
+                        }
+                        phases_after_lock = Some(remaining - 1);
+                    }
+                    // v8demod only needs enough CRC-valid blocks to locate the
+                    // field grid.  Once locked, expected block positions are
+                    // decoded directly and CRC decides whether a wider phase
+                    // search is necessary.
+                    if stop_after_field_lock
+                        && workers == 1
+                        && phases_after_lock.is_none()
+                        && !field_starts(&local, sample_rate, bit_rate).is_empty()
+                    {
+                        phases_after_lock = Some(2);
+                    }
                 }
                 local
             }));
@@ -266,8 +289,18 @@ pub fn hard_block_at(
     // The field-start estimate comes from several independently decoded
     // blocks and can be displaced by more than half a bit. Search a wide
     // local interval; CRC selects the unambiguous phase.
+    // Try the field-grid prediction first.  Most clean blocks finish after
+    // this single attempt.  Only a CRC failure expands the search symmetrically
+    // out to +/-1.5 bits.
     for trial in 0..49 {
-        let adjust = (-1.5 + 3.0 * trial as f64 / 48.0) * spb;
+        let step = if trial == 0 {
+            0.0
+        } else {
+            let distance = (trial + 1) / 2;
+            let sign = if trial & 1 == 1 { 1.0 } else { -1.0 };
+            sign * 1.5 * distance as f64 / 24.0
+        };
+        let adjust = step * spb;
         let mut raw = [0_u8; BLOCK_BYTES];
         let mut score = 0.0;
         for bit in 0..PAYLOAD_BITS {

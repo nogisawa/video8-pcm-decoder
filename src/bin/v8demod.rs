@@ -178,6 +178,7 @@ fn main() -> io::Result<()> {
                     phases,
                     gate,
                     1,
+                    true,
                 );
                 if result_tx
                     .send(WindowResult {
