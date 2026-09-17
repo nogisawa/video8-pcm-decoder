@@ -9,6 +9,50 @@ pub const FIELD_BYTES: usize = BLOCK_BYTES * BLOCKS_PER_FIELD;
 pub const SAMPLES_PER_FIELD: usize = 525;
 pub const WAV_RATE: u32 = 31_469;
 
+/// Stereo reconstruction low-pass used after the 8-to-10-bit expansion.
+/// The Video8 PCM passband ends at 15 kHz, very close to the 15.7345 kHz
+/// Nyquist frequency.  A real player has an analogue reconstruction filter;
+/// raw WAV samples otherwise retain a conspicuous alternating component.
+pub struct ReconstructionFilter {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: [f64; 2],
+    z2: [f64; 2],
+}
+
+impl ReconstructionFilter {
+    pub fn new(cutoff_hz: f64) -> Self {
+        let omega = 2.0 * std::f64::consts::PI * cutoff_hz / WAV_RATE as f64;
+        let (sin, cos) = omega.sin_cos();
+        let alpha = sin / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+        let norm = 1.0 / (1.0 + alpha);
+        Self {
+            b0: (1.0 - cos) * 0.5 * norm,
+            b1: (1.0 - cos) * norm,
+            b2: (1.0 - cos) * 0.5 * norm,
+            a1: -2.0 * cos * norm,
+            a2: (1.0 - alpha) * norm,
+            z1: [0.0; 2],
+            z2: [0.0; 2],
+        }
+    }
+
+    pub fn process_field(&mut self, audio: &mut [[Option<i16>; 2]; SAMPLES_PER_FIELD]) {
+        for frame in audio {
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                let input = sample.unwrap_or(0) as f64;
+                let output = self.b0 * input + self.z1[channel];
+                self.z1[channel] = self.b1 * input - self.a1 * output + self.z2[channel];
+                self.z2[channel] = self.b2 * input - self.a2 * output;
+                *sample = Some(output.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16);
+            }
+        }
+    }
+}
+
 pub fn crc16_video8(data: &[u8]) -> u16 {
     let mut crc = 0xffff_u16;
     for &byte in data {

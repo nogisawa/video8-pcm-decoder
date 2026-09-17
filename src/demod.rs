@@ -93,16 +93,44 @@ fn bits_for_phase(data: &[f64], spb: f64, phase: f64) -> Vec<u8> {
         .collect()
 }
 
-fn pack_block(bits: &[u8], start: usize) -> [u8; BLOCK_BYTES] {
-    let mut raw = [0_u8; BLOCK_BYTES];
-    for byte in 0..BLOCK_BYTES {
-        let mut value = 0_u8;
-        for bit in 0..8 {
-            value |= bits[start + byte * 8 + bit] << bit;
-        }
-        raw[byte] = value;
+#[inline]
+fn pack_byte(bits: &[u8], start: usize) -> u8 {
+    let mut value = 0_u8;
+    for bit in 0..8 {
+        value |= bits[start + bit] << bit;
     }
-    raw
+    value
+}
+
+fn scan_phase(filtered: &[f64], absolute_start: i64, spb: f64, phase: f64) -> Vec<Candidate> {
+    let bits = bits_for_phase(filtered, spb, phase);
+    if bits.len() < PAYLOAD_BITS {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for start in 0..=bits.len() - PAYLOAD_BITS {
+        // Test the address before packing the remaining 96 bits. Random RF
+        // rejects almost half of all candidates here.
+        let address = pack_byte(&bits, start);
+        if address >= BLOCKS_PER_FIELD as u8 {
+            continue;
+        }
+        let mut raw = [0_u8; BLOCK_BYTES];
+        raw[0] = address;
+        for byte in 1..BLOCK_BYTES {
+            raw[byte] = pack_byte(&bits, start + byte * 8);
+        }
+        let recorded = u16::from_le_bytes([raw[11], raw[12]]);
+        if crc16_video8(&raw[..11]) != recorded {
+            continue;
+        }
+        found.push(Candidate {
+            sample: absolute_start as f64 + phase + start as f64 * spb,
+            address,
+            raw,
+        });
+    }
+    found
 }
 
 pub fn scan_window(
@@ -112,32 +140,91 @@ pub fn scan_window(
     bit_rate: f64,
     phases: usize,
 ) -> (Vec<f64>, Vec<Candidate>) {
+    scan_window_gated(input, absolute_start, sample_rate, bit_rate, phases, 0.0)
+}
+
+/// High-frequency activity relative to the total signal level.  Manchester
+/// PCM has many sample-to-sample transitions, whereas an empty part of the
+/// capture is comparatively smooth.  The ratio also makes the gate mostly
+/// independent of capture gain.
+pub fn activity_ratio(input: &[f32]) -> f64 {
+    if input.len() < 2 {
+        return 0.0;
+    }
+    let mut signal_energy = 0.0_f64;
+    let mut difference_energy = 0.0_f64;
+    let mut previous = input[0] as f64;
+    signal_energy += previous * previous;
+    for &sample in &input[1..] {
+        let current = sample as f64;
+        let difference = current - previous;
+        signal_energy += current * current;
+        difference_energy += difference * difference;
+        previous = current;
+    }
+    if signal_energy <= f64::EPSILON {
+        return 0.0;
+    }
+    (difference_energy / signal_energy).sqrt()
+}
+
+pub fn scan_window_gated(
+    input: &[f32],
+    absolute_start: i64,
+    sample_rate: f64,
+    bit_rate: f64,
+    phases: usize,
+    gate_threshold: f64,
+) -> (Vec<f64>, Vec<Candidate>) {
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(phases);
+    scan_window_gated_with_workers(
+        input,
+        absolute_start,
+        sample_rate,
+        bit_rate,
+        phases,
+        gate_threshold,
+        workers,
+    )
+}
+
+pub fn scan_window_gated_with_workers(
+    input: &[f32],
+    absolute_start: i64,
+    sample_rate: f64,
+    bit_rate: f64,
+    phases: usize,
+    gate_threshold: f64,
+    workers: usize,
+) -> (Vec<f64>, Vec<Candidate>) {
+    if gate_threshold > 0.0 && activity_ratio(input) < gate_threshold {
+        return (Vec::new(), Vec::new());
+    }
     let filtered = bandpass_zero_phase(input);
     let spb = sample_rate / bit_rate;
-    let mut found = Vec::new();
-    for phase_index in 0..phases {
-        let phase = phase_index as f64 * spb / phases as f64;
-        let bits = bits_for_phase(&filtered, spb, phase);
-        if bits.len() < PAYLOAD_BITS {
-            continue;
+    let workers = workers.max(1).min(phases);
+    let found = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let filtered = &filtered;
+            handles.push(scope.spawn(move || {
+                let mut local = Vec::new();
+                for phase_index in (worker..phases).step_by(workers) {
+                    let phase = phase_index as f64 * spb / phases as f64;
+                    local.extend(scan_phase(filtered, absolute_start, spb, phase));
+                }
+                local
+            }));
         }
-        for start in 0..=bits.len() - PAYLOAD_BITS {
-            // Address range rejects about half of noise candidates cheaply.
-            let raw = pack_block(&bits, start);
-            if raw[0] >= BLOCKS_PER_FIELD as u8 {
-                continue;
-            }
-            let recorded = u16::from_le_bytes([raw[11], raw[12]]);
-            if crc16_video8(&raw[..11]) != recorded {
-                continue;
-            }
-            found.push(Candidate {
-                sample: absolute_start as f64 + phase + start as f64 * spb,
-                address: raw[0],
-                raw,
-            });
+        let mut combined = Vec::new();
+        for handle in handles {
+            combined.extend(handle.join().expect("phase worker panicked"));
         }
-    }
+        combined
+    });
     (filtered, found)
 }
 

@@ -130,6 +130,9 @@ target/release/v8demod ../capture.flac -o pcm.bin
 target/release/v8wav pcm.bin output.wav
 ```
 
+`v8demod`は既定で信号活動量の低い解析窓をスキップします。弱いPCM信号を取りこぼす場合は
+`--gate`を小さくし、完全に無効化する場合は`--gate 0`を指定してください。
+
 注意: CRC不良が1件でもあると`v8crc`は全データを通過させた後に終了コード1を
 返します。通常のシェルパイプでは後段まで処理されますが、`set -o pipefail`を
 使用しているスクリプトではパイプ全体が失敗扱いになります。
@@ -200,6 +203,9 @@ target/release/v8demod [OPTIONS] INPUT.flac
 | `--phases N` | 試行するクロック位相数 | `12` |
 | `--window-ms MS` | 重複解析窓 | `8` |
 | `--overlap-ms MS` | 解析窓の重複幅 | `4` |
+| `--gate RATIO` | 低活動窓を省く相対強度。`0`で無効 | `0.12` |
+| `--threads N` | 並列に解析する常駐worker数 | 論理CPU数 |
+| `--buffer-windows N` | readerとworker間で先読みする窓数 | `threads × 2` |
 | `--start SEC` | 復調開始位置 | `0` |
 | `--duration SEC` | 復調する実時間 | ファイル末尾まで |
 
@@ -217,6 +223,10 @@ target/release/v8demod ../capture.flac \
 
 `--phases`を増やすとクロック位相の取りこぼしを減らせる可能性がありますが、
 処理時間はほぼ比例して増えます。
+
+FLACの読み込み、窓解析、順序付き出力はパイプラインで並行動作します。メモリ使用量を
+抑えたい場合は`--buffer-windows`を小さくします。通常はCPUコア数と同程度から2倍が
+適切です。worker数を増やしすぎるとメモリ帯域が律速になり、逆に遅くなる場合があります。
 
 ## v8crc: CRC検査
 
@@ -267,6 +277,16 @@ target/release/v8wav [OPTIONS] INPUT.bin OUTPUT.wav
 
 ```sh
 target/release/v8wav pcm.bin output.wav
+```
+
+`v8wav`と`v8decode`は、実機D/A後の再構成フィルタに相当する15 kHzローパスを
+既定で適用します。Video8 PCMのサンプリング周波数は約31.469 kHzなので、これにより
+ナイキスト端（約15.7345 kHz）の1サンプルおきの波打ちを除去します。カットオフは
+`--lowpass HZ`で変更でき、従来の無加工出力は`--lowpass 0`で得られます。
+
+```sh
+target/release/v8wav --lowpass 14500 pcm.bin output.wav
+target/release/v8wav --lowpass 0 pcm.bin unfiltered.wav
 ```
 
 CRC不良ブロックをそのまま使う場合:

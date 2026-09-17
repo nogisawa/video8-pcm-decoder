@@ -4,7 +4,10 @@ use std::{
     io::{self, BufReader, BufWriter, Seek, SeekFrom, Write},
     process,
 };
-use v8pcm::{FIELD_BYTES, WAV_RATE, conceal_field, decode_field, read_exact_or_eof, write_pcm};
+use v8pcm::{
+    FIELD_BYTES, ReconstructionFilter, WAV_RATE, conceal_field, decode_field, read_exact_or_eof,
+    write_pcm,
+};
 
 fn header(data_bytes: u32) -> [u8; 44] {
     let mut h = [0u8; 44];
@@ -28,16 +31,33 @@ fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() == 1 || args.iter().any(|x| x == "-h" || x == "--help") {
         println!(
-            "v8wav - convert Video8 blocks directly to WAV\n\nUsage: v8wav [--use-bad-crc] INPUT.bin OUTPUT.wav"
+            "v8wav - convert Video8 blocks directly to WAV\n\nUsage: v8wav [--use-bad-crc] [--lowpass HZ] INPUT.bin OUTPUT.wav\n\n--lowpass defaults to 15000 Hz; use --lowpass 0 to disable it."
         );
         return Ok(());
     }
     let use_bad = args.iter().any(|x| x == "--use-bad-crc");
-    let positional: Vec<_> = args
-        .iter()
-        .skip(1)
-        .filter(|x| !x.starts_with('-'))
-        .collect();
+    let mut lowpass = 15_000.0_f64;
+    let mut positional = Vec::new();
+    let mut at = 1;
+    while at < args.len() {
+        match args[at].as_str() {
+            "--use-bad-crc" => {}
+            "--lowpass" => {
+                at += 1;
+                lowpass = args.get(at).and_then(|x| x.parse().ok()).unwrap_or(-1.0);
+            }
+            value if value.starts_with('-') => {
+                eprintln!("unknown option: {value}");
+                process::exit(2);
+            }
+            _ => positional.push(&args[at]),
+        }
+        at += 1;
+    }
+    if !(0.0..WAV_RATE as f64 / 2.0).contains(&lowpass) && lowpass != 0.0 {
+        eprintln!("--lowpass must be 0 or below {} Hz", WAV_RATE / 2);
+        process::exit(2);
+    }
     if positional.len() != 2 {
         eprintln!("expected INPUT and OUTPUT; use --help");
         process::exit(2)
@@ -47,10 +67,14 @@ fn main() -> io::Result<()> {
     let mut output = BufWriter::new(file);
     output.write_all(&[0u8; 44])?;
     let mut field = [0u8; FIELD_BYTES];
+    let mut reconstruction = (lowpass > 0.0).then(|| ReconstructionFilter::new(lowpass));
     let (mut fields, mut concealed) = (0usize, 0usize);
     while read_exact_or_eof(&mut input, &mut field)? {
         let mut audio = decode_field(&field, use_bad);
         concealed += conceal_field(&mut audio);
+        if let Some(filter) = &mut reconstruction {
+            filter.process_field(&mut audio);
+        }
         write_pcm(&audio, &mut output)?;
         fields += 1;
     }
