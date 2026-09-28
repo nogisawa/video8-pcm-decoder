@@ -4,6 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 from time import perf_counter
+from concurrent.futures import ProcessPoolExecutor
+from collections import deque
 
 import numpy as np
 import soundfile as sf
@@ -127,13 +129,14 @@ def decode_track(samples: np.ndarray, absolute_start: int, marker_sample: int,
 
 def demodulate_tracks(path: Path, output: Path, rate: float, start: float,
                       duration: float | None, phases: int,
-                      stats: dict | None = None) -> int:
-    """Scan and decode tracks as they arrive; memory is independent of file size."""
+                      stats: dict | None = None, workers: int = 1) -> int:
+    """Scan and decode with a bounded, ordered track worker queue."""
     period = FIELD_PERIOD * rate
     written = 0
     previous_peak = None
     previous_number = None
     index = 0
+    completed = 0
     crc_good = crc_bad = missing_fields = 0
     started = perf_counter()
     first = round(start * rate)
@@ -141,52 +144,66 @@ def demodulate_tracks(path: Path, output: Path, rate: float, start: float,
 
     def progress(done: int, last: int) -> None:
         nonlocal last_report
-        completed = int((done - first) / rate)
-        if completed > last_report:
-            last_report = completed
+        processed = int((done - first) / rate)
+        if processed > last_report:
+            last_report = processed
             print(f'\rscan+decode {min(done, last) / rate:.1f}s/'
-                  f'{last / rate:.1f}s tracks={index}', end='',
+                  f'{last / rate:.1f}s tracks={completed}/{index}', end='',
                   file=sys.stderr, flush=True)
 
+    def write_result(peak, result, sink):
+        nonlocal written, previous_peak, previous_number
+        nonlocal crc_good, crc_bad, missing_fields, completed
+        if previous_peak is None:
+            number = 0
+        else:
+            number = previous_number + max(1, round((peak - previous_peak) / period))
+            for missing in range(previous_number + 1, number):
+                expected = round(previous_peak + (missing - previous_number) * period +
+                                 .00025 * rate)
+                write_field(sink, Field(missing, expected, False,
+                                        bytes(NTSC_FIELD_BYTES)))
+                written += 1
+                missing_fields += 1
+        if result is None:
+            write_field(sink, Field(number, round(peak + .00025 * rate),
+                                    False, bytes(NTSC_FIELD_BYTES)))
+            missing_fields += 1
+        else:
+            zero, blocks, good = result
+            write_field(sink, Field(number, max(0, round(zero)), True, blocks))
+            crc_good += good
+            crc_bad += 132 - good
+        written += 1
+        completed += 1
+        previous_peak, previous_number = peak, number
+        if completed % 10 == 0:
+            sink.flush()
+
     with sf.SoundFile(path) as scanner, sf.SoundFile(path) as source, \
-            output.open('wb') as sink:
+            output.open('wb') as sink, ProcessPoolExecutor(
+                max_workers=workers) as pool:
         write_header(sink, rate)
+        pending = deque()
         for index, (preamble, _postamble) in enumerate(
                 iter_preamble_pairs(scanner, rate, 'ntsc', start, duration,
                                     20.0, progress), 1):
             peak = preamble[0]
-            if previous_peak is None:
-                number = 0
-            else:
-                number = previous_number + max(1, round((peak - previous_peak) / period))
-                for missing in range(previous_number + 1, number):
-                    expected = round(previous_peak + (missing - previous_number) * period +
-                                     .00025 * rate)
-                    write_field(sink, Field(missing, expected, False,
-                                            bytes(NTSC_FIELD_BYTES)))
-                    written += 1
-                    missing_fields += 1
             left = max(0, round(peak - .00025 * rate))
             right = min(source.frames, round(peak + .0031 * rate))
             source.seek(left)
             samples = source.read(right - left, dtype='float32')
-            result = decode_track(samples, left, peak, rate, phases)
-            if result is None:
-                write_field(sink, Field(number, round(peak + .00025 * rate),
-                                        False, bytes(NTSC_FIELD_BYTES)))
-                missing_fields += 1
-            else:
-                zero, blocks, good = result
-                write_field(sink, Field(number, max(0, round(zero)), True, blocks))
-                crc_good += good
-                crc_bad += 132 - good
-            written += 1
-            previous_peak, previous_number = peak, number
-            if index % 10 == 0:
-                sink.flush()
+            pending.append((peak, pool.submit(
+                decode_track, samples, left, peak, rate, phases)))
+            if len(pending) >= workers * 2:
+                oldest_peak, future = pending.popleft()
+                write_result(oldest_peak, future.result(), sink)
+        while pending:
+            oldest_peak, future = pending.popleft()
+            write_result(oldest_peak, future.result(), sink)
     print(file=sys.stderr)
-    print(f'markers={index} elapsed={perf_counter() - started:.3f}s',
-          file=sys.stderr)
+    print(f'markers={index} elapsed={perf_counter() - started:.3f}s '
+          f'workers={workers}', file=sys.stderr)
     if stats is not None:
         stats.update(good=crc_good, bad=crc_bad, missing=missing_fields)
     return written

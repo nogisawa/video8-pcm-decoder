@@ -2,6 +2,7 @@
 """Demodulate CXADC FLAC to timestamped NTSC Video8 PCM fields."""
 from __future__ import annotations
 import argparse
+import os
 from pathlib import Path
 import sys
 
@@ -18,9 +19,10 @@ from v8crc import count_file, error_rate
 
 def demodulate(path, output, rate, start, duration, window_ms, phases,
                backend: DemodBackend = CPU_BACKEND, scan_mode: str = "track",
-               stats: dict | None = None):
+               stats: dict | None = None, workers: int = 1):
     if scan_mode == "track":
-        return demodulate_tracks(path, output, rate, start, duration, phases, stats)
+        return demodulate_tracks(path, output, rate, start, duration, phases,
+                                 stats, workers)
     if scan_mode == "markers":
         valid = extract_markers(path, rate, start, duration, phases, backend)
     elif scan_mode == "locked":
@@ -83,11 +85,15 @@ def main():
     p.add_argument("--duration", type=float)
     p.add_argument("--window-ms", type=float, default=8)
     p.add_argument("--phases", type=int, default=12)
+    available = (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+                 else os.cpu_count() or 1)
+    p.add_argument("--workers", type=int, default=min(4, available),
+                   help="parallel track decoder processes (default: up to 4 available CPUs)")
     p.add_argument("--scan-mode", choices=("exhaustive", "locked", "markers", "track"),
                    default="track", help="track mode loads and decodes one marked track at a time")
     a = p.parse_args()
     if a.start < 0 or (a.duration is not None and a.duration <= 0) or \
-            a.window_ms <= 0 or a.phases < 1:
+            a.window_ms <= 0 or a.phases < 1 or a.workers < 1:
         p.error("invalid scan parameters")
     with sf.SoundFile(a.input) as source:
         rate = a.sample_rate or float(source.samplerate)
@@ -96,7 +102,7 @@ def main():
     stats = {}
     count = demodulate(a.input, a.output, rate, a.start, a.duration,
                        a.window_ms, a.phases, scan_mode=a.scan_mode,
-                       stats=stats)
+                       stats=stats, workers=a.workers)
     print(f"wrote {count} timestamped fields to {a.output}", file=sys.stderr)
     if stats:
         good, bad, missing = stats["good"], stats["bad"], stats["missing"]
