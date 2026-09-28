@@ -77,6 +77,56 @@ def pairs(events: list[tuple[int, float]], sample_rate: float
     return result
 
 
+
+
+def iter_preamble_pairs(source: sf.SoundFile, sample_rate: float,
+                        system: str, start: float, duration: float | None,
+                        threshold: float, progress=None):
+    """Yield paired run-in tones while scanning bounded chunks of the FLAC.
+
+    The burst and pair state is kept across chunk boundaries.  This uses the
+    same STFT windows as detect(), but does not retain hits for the whole file.
+    """
+    bit_rate = NTSC_BIT_RATE if system == "ntsc" else PAL_BIT_RATE
+    first = min(source.frames, round(start * sample_rate))
+    last = (source.frames if duration is None else
+            min(source.frames, first + round(duration * sample_rate)))
+    chunk = round(.1 * sample_rate)
+    context = round(.004 * sample_rate) + WINDOW
+    maximum_gap = round(.00045 * sample_rate)
+    best = None
+    last_hit = None
+    pending = None
+    for position in range(first, last, chunk):
+        left = max(0, position - context)
+        right = min(source.frames, position + chunk + context)
+        source.seek(left)
+        samples = source.read(right - left, dtype="float32")
+        for hit in tone_hits(samples, left, sample_rate, bit_rate, threshold):
+            if not position <= hit[0] < min(position + chunk, last):
+                continue
+            if best is None:
+                best = hit
+            elif hit[0] - last_hit <= maximum_gap:
+                if hit[1] > best[1]:
+                    best = hit
+            else:
+                if pending is None:
+                    pending = best
+                elif .0022 <= (best[0] - pending[0]) / sample_rate <= .0032:
+                    yield pending, best
+                    pending = None
+                else:
+                    pending = best
+                best = hit
+            last_hit = hit[0]
+        if progress is not None:
+            progress(min(position + chunk, last), last)
+    if best is not None:
+        if pending is not None and .0022 <= (best[0] - pending[0]) / sample_rate <= .0032:
+            yield pending, best
+
+
 def pilot_at(source: sf.SoundFile, preamble_sample: int, sample_rate: float,
              system: str) -> tuple[str, float, list[float]]:
     # Use the middle of the PCM track. The pilot also exists in that area.
@@ -156,19 +206,42 @@ def main() -> int:
     if rate < 1_000_000:
         rate *= 1000
     started = perf_counter()
-    rows, scan, total, covered = detect(
-        a.input, rate, a.system, a.start, a.duration, a.threshold)
+    count = 0
+    pilot_seconds = 0.0
     sink = a.output.open("w", encoding="utf-8") if a.output else sys.stdout
     try:
-        for row in rows:
-            sink.write(json.dumps(row, separators=(",", ":")) + "\n")
+        with sf.SoundFile(a.input) as scanner, sf.SoundFile(a.input) as pilot_source:
+            first = min(scanner.frames, round(a.start * rate))
+            last = (scanner.frames if a.duration is None else
+                    min(scanner.frames, first + round(a.duration * rate)))
+            covered = (last - first) / rate
+            for preamble, postamble in iter_preamble_pairs(
+                    scanner, rate, a.system, a.start, a.duration, a.threshold):
+                pilot_started = perf_counter()
+                label, confidence, scores = pilot_at(
+                    pilot_source, preamble[0], rate, a.system)
+                pilot_seconds += perf_counter() - pilot_started
+                row = {
+                    "preamble_peak_sample": preamble[0],
+                    "preamble_peak_seconds": preamble[0] / rate,
+                    "preamble_ratio": round(preamble[1], 2),
+                    "postamble_peak_seconds": postamble[0] / rate,
+                    "pilot": label,
+                    "pilot_confidence": round(confidence, 2),
+                    "pilot_scores": [round(value, 6) for value in scores],
+                }
+                sink.write(json.dumps(row, separators=(",", ":")) + "\n")
+                count += 1
+                if count % 10 == 0:
+                    sink.flush()
     finally:
         if a.output:
             sink.close()
-    print(f"input={covered:.3f}s tracks={len(rows)} "
-          f"preamble_scan={scan:.3f}s pilot_scan={total-scan:.3f}s "
-          f"total={total:.3f}s wall={perf_counter()-started:.3f}s", file=sys.stderr)
-    return 0 if rows else 2
+    total = perf_counter() - started
+    print(f"input={covered:.3f}s tracks={count} "
+          f"preamble_scan={total-pilot_seconds:.3f}s pilot_scan={pilot_seconds:.3f}s "
+          f"total={total:.3f}s", file=sys.stderr)
+    return 0 if count else 2
 
 
 if __name__ == "__main__":

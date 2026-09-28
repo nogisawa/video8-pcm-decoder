@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from time import perf_counter
 
 import numpy as np
 import soundfile as sf
@@ -11,7 +12,7 @@ from cpu_backend import (CRC_BASE, CRC_CONTRIBUTIONS, filter_samples,
                          scan_window)
 from pcm_core import BLOCK_BITS, NTSC_BIT_RATE, Block, crc16_video8
 from timed import FIELD_PERIOD, NTSC_FIELD_BYTES, Field, write_field, write_header
-from v8markers import detect
+from v8markers import iter_preamble_pairs
 from video8pcm import _deduplicate, _keep_sequences
 
 
@@ -125,19 +126,35 @@ def decode_track(samples: np.ndarray, absolute_start: int, marker_sample: int,
 
 
 def demodulate_tracks(path: Path, output: Path, rate: float, start: float,
-                      duration: float | None, phases: int) -> int:
-    markers, preamble_time, marker_time, _ = detect(
-        path, rate, 'ntsc', start, duration, 20.0)
-    print(f'markers={len(markers)} preamble_scan={preamble_time:.3f}s '
-          f'pilot_scan={marker_time-preamble_time:.3f}s', file=sys.stderr)
+                      duration: float | None, phases: int,
+                      stats: dict | None = None) -> int:
+    """Scan and decode tracks as they arrive; memory is independent of file size."""
     period = FIELD_PERIOD * rate
     written = 0
     previous_peak = None
     previous_number = None
-    with sf.SoundFile(path) as source, output.open('wb') as sink:
+    index = 0
+    crc_good = crc_bad = missing_fields = 0
+    started = perf_counter()
+    first = round(start * rate)
+    last_report = -1
+
+    def progress(done: int, last: int) -> None:
+        nonlocal last_report
+        completed = int((done - first) / rate)
+        if completed > last_report:
+            last_report = completed
+            print(f'\rscan+decode {min(done, last) / rate:.1f}s/'
+                  f'{last / rate:.1f}s tracks={index}', end='',
+                  file=sys.stderr, flush=True)
+
+    with sf.SoundFile(path) as scanner, sf.SoundFile(path) as source, \
+            output.open('wb') as sink:
         write_header(sink, rate)
-        for index, marker in enumerate(markers, 1):
-            peak = marker['preamble_peak_sample']
+        for index, (preamble, _postamble) in enumerate(
+                iter_preamble_pairs(scanner, rate, 'ntsc', start, duration,
+                                    20.0, progress), 1):
+            peak = preamble[0]
             if previous_peak is None:
                 number = 0
             else:
@@ -148,6 +165,7 @@ def demodulate_tracks(path: Path, output: Path, rate: float, start: float,
                     write_field(sink, Field(missing, expected, False,
                                             bytes(NTSC_FIELD_BYTES)))
                     written += 1
+                    missing_fields += 1
             left = max(0, round(peak - .00025 * rate))
             right = min(source.frames, round(peak + .0031 * rate))
             source.seek(left)
@@ -156,13 +174,19 @@ def demodulate_tracks(path: Path, output: Path, rate: float, start: float,
             if result is None:
                 write_field(sink, Field(number, round(peak + .00025 * rate),
                                         False, bytes(NTSC_FIELD_BYTES)))
+                missing_fields += 1
             else:
                 zero, blocks, good = result
                 write_field(sink, Field(number, max(0, round(zero)), True, blocks))
+                crc_good += good
+                crc_bad += 132 - good
             written += 1
             previous_peak, previous_number = peak, number
-            if index % 10 == 0 or index == len(markers):
-                print(f'\rtrack decode {index}/{len(markers)}', end='',
-                      file=sys.stderr, flush=True)
+            if index % 10 == 0:
+                sink.flush()
     print(file=sys.stderr)
+    print(f'markers={index} elapsed={perf_counter() - started:.3f}s',
+          file=sys.stderr)
+    if stats is not None:
+        stats.update(good=crc_good, bad=crc_bad, missing=missing_fields)
     return written

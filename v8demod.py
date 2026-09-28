@@ -12,12 +12,14 @@ from video8pcm import BLOCK_BITS, NTSC_BIT_RATE, _split_fields, extract
 from demod_backend import CPU_BACKEND, DemodBackend
 from field_scan import extract_locked, extract_markers
 from track_decode import demodulate_tracks
+from v8crc import count_file, error_rate
 
 
 def demodulate(path, output, rate, start, duration, window_ms, phases,
-               backend: DemodBackend = CPU_BACKEND, scan_mode: str = "track"):
+               backend: DemodBackend = CPU_BACKEND, scan_mode: str = "track",
+               stats: dict | None = None):
     if scan_mode == "track":
-        return demodulate_tracks(path, output, rate, start, duration, phases)
+        return demodulate_tracks(path, output, rate, start, duration, phases, stats)
     if scan_mode == "markers":
         valid = extract_markers(path, rate, start, duration, phases, backend)
     elif scan_mode == "locked":
@@ -90,9 +92,18 @@ def main():
         rate = a.sample_rate or float(source.samplerate)
     if rate < 1_000_000:
         rate *= 1000
+    stats = {}
     count = demodulate(a.input, a.output, rate, a.start, a.duration,
-                       a.window_ms, a.phases, scan_mode=a.scan_mode)
+                       a.window_ms, a.phases, scan_mode=a.scan_mode,
+                       stats=stats)
     print(f"wrote {count} timestamped fields to {a.output}", file=sys.stderr)
+    if stats:
+        good, bad, missing = stats["good"], stats["bad"], stats["missing"]
+    else:
+        good, bad, missing = count_file(a.output)
+    print(f"input CRC error rate: {error_rate(bad, good + bad)} "
+          f"({bad}/{good + bad} blocks, missing_fields={missing})",
+          file=sys.stderr)
     return 0 if count else 2
 
 
