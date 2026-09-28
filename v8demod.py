@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Demodulate CXADC FLAC to timestamped NTSC Video8 PCM fields."""
+from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys

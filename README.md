@@ -5,7 +5,7 @@ CRC検査、デインタリーブ、16-bit stereo WAV化を独立したコマン
 
 ## 準備
 
-Python 3.10以降と `numpy`, `scipy`, `soundfile` が必要です。`soundfile` は環境に
+Python 3.9以降と `numpy`, `scipy`, `soundfile` が必要です。`soundfile` は環境に
 よってOSの `libsndfile` を使います。
 
 ```sh
