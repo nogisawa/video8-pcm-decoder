@@ -79,31 +79,76 @@ def pairs(events: list[tuple[int, float]], sample_rate: float
 
 
 
+UNKNOWN_FRAME_LIMIT = 1 << 62
+
+
+def read_window(source: sf.SoundFile, left: int, right: int):
+    """Read one bounded window, recovering samples before a decoder failure.
+
+    Some FLACs have no total-sample count.  In that case libsndfile reports
+    2**63-1 frames and soundfile can raise when a read crosses the real EOF.
+    An error poisons the handle, so retries use fresh handles.
+    """
+    count = max(0, right - left)
+    try:
+        source.seek(left)
+        return source.read(count, dtype="float32"), None
+    except sf.LibsndfileError as exc:
+        low, high = 0, count + 1
+        best = np.empty(0, dtype=np.float32)
+        while high - low > 1:
+            middle = (low + high) // 2
+            try:
+                with sf.SoundFile(source.name) as retry:
+                    retry.seek(left)
+                    data = retry.read(middle, dtype="float32")
+            except sf.LibsndfileError:
+                high = middle
+            else:
+                if len(data) < middle:
+                    return data, str(exc)
+                low, best = middle, data
+        return best, str(exc)
+
+
 def iter_preamble_pairs(source: sf.SoundFile, sample_rate: float,
                         system: str, start: float, duration: float | None,
-                        threshold: float, progress=None):
-    """Yield paired run-in tones while scanning bounded chunks of the FLAC.
-
-    The burst and pair state is kept across chunk boundaries.  This uses the
-    same STFT windows as detect(), but does not retain hits for the whole file.
-    """
+                        threshold: float, progress=None, state=None):
+    """Yield paired run-in tones from bounded chunks, including unknown-length FLACs."""
     bit_rate = NTSC_BIT_RATE if system == "ntsc" else PAL_BIT_RATE
-    first = min(source.frames, round(start * sample_rate))
-    last = (source.frames if duration is None else
-            min(source.frames, first + round(duration * sample_rate)))
+    known_length = source.frames < UNKNOWN_FRAME_LIMIT
+    first = round(start * sample_rate)
+    if known_length:
+        first = min(source.frames, first)
+    if duration is None:
+        last = source.frames if known_length else None
+    else:
+        last = first + round(duration * sample_rate)
+        if known_length:
+            last = min(last, source.frames)
     chunk = round(.1 * sample_rate)
     context = round(.004 * sample_rate) + WINDOW
     maximum_gap = round(.00045 * sample_rate)
     best = None
     last_hit = None
     pending = None
-    for position in range(first, last, chunk):
+    position = first
+    if state is not None:
+        state.update(known_length=known_length, last_sample=first, read_error=None)
+    while last is None or position < last:
         left = max(0, position - context)
-        right = min(source.frames, position + chunk + context)
-        source.seek(left)
-        samples = source.read(right - left, dtype="float32")
+        right = position + chunk + context
+        if known_length:
+            right = min(source.frames, right)
+        samples, error = read_window(source, left, right)
+        available_end = left + len(samples)
+        if state is not None:
+            state["last_sample"] = max(state["last_sample"], available_end)
+        accepted_end = min(position + chunk, available_end)
+        if last is not None:
+            accepted_end = min(accepted_end, last)
         for hit in tone_hits(samples, left, sample_rate, bit_rate, threshold):
-            if not position <= hit[0] < min(position + chunk, last):
+            if not position <= hit[0] < accepted_end:
                 continue
             if best is None:
                 best = hit
@@ -121,7 +166,17 @@ def iter_preamble_pairs(source: sf.SoundFile, sample_rate: float,
                 best = hit
             last_hit = hit[0]
         if progress is not None:
-            progress(min(position + chunk, last), last)
+            progress(accepted_end, last)
+        if error is not None:
+            if state is not None:
+                # Internal seek failure at an unknown-length EOF is a
+                # libsndfile limitation; lost sync can also mean corruption.
+                state["read_error"] = error
+                state["expected_eof"] = not known_length and "psf_fseek" in error
+            break
+        if len(samples) < right - left:
+            break
+        position += chunk
     if best is not None:
         if pending is not None and .0022 <= (best[0] - pending[0]) / sample_rate <= .0032:
             yield pending, best
@@ -150,31 +205,20 @@ def pilot_at(source: sf.SoundFile, preamble_sample: int, sample_rate: float,
 
 def detect(path: Path, sample_rate: float, system: str, start: float,
            duration: float | None, threshold: float):
-    bit_rate = NTSC_BIT_RATE if system == "ntsc" else PAL_BIT_RATE
-    search_started = perf_counter()
-    hits: list[tuple[int, float]] = []
-    with sf.SoundFile(path) as source:
-        first = min(source.frames, round(start * sample_rate))
-        last = (source.frames if duration is None else
-                min(source.frames, first + round(duration * sample_rate)))
-        chunk = round(.1 * sample_rate)
-        context = round(.004 * sample_rate) + WINDOW
-        for position in range(first, last, chunk):
-            left = max(0, position - context)
-            right = min(source.frames, position + chunk + context)
-            source.seek(left)
-            samples = source.read(right - left, dtype="float32")
-            hits.extend((sample, ratio) for sample, ratio in
-                        tone_hits(samples, left, sample_rate, bit_rate, threshold)
-                        if position <= sample < min(position + chunk, last))
-    events = bursts(sorted(hits), sample_rate)
-    matched = pairs(events, sample_rate)
-    scan_seconds = perf_counter() - search_started
+    """Collect markers for legacy callers; the scanner itself remains bounded."""
+    started = perf_counter()
+    pilot_seconds = 0.0
     results = []
-    with sf.SoundFile(path) as source:
-        for preamble, postamble in matched:
+    state = {}
+    with sf.SoundFile(path) as scanner, sf.SoundFile(path) as pilot_source:
+        first = round(start * sample_rate)
+        for preamble, postamble in iter_preamble_pairs(
+                scanner, sample_rate, system, start, duration, threshold,
+                state=state):
+            pilot_started = perf_counter()
             label, confidence, scores = pilot_at(
-                source, preamble[0], sample_rate, system)
+                pilot_source, preamble[0], sample_rate, system)
+            pilot_seconds += perf_counter() - pilot_started
             results.append({
                 "preamble_peak_sample": preamble[0],
                 "preamble_peak_seconds": preamble[0] / sample_rate,
@@ -184,8 +228,12 @@ def detect(path: Path, sample_rate: float, system: str, start: float,
                 "pilot_confidence": round(confidence, 2),
                 "pilot_scores": [round(value, 6) for value in scores],
             })
-    total_seconds = perf_counter() - search_started
-    return results, scan_seconds, total_seconds, (last - first) / sample_rate
+    total = perf_counter() - started
+    covered = max(0, state["last_sample"] - first) / sample_rate
+    if state.get("read_error") and not state.get("expected_eof"):
+        print(f"FLAC decode stopped near {covered:.3f}s: "
+              f"{state['read_error']}", file=sys.stderr)
+    return results, total - pilot_seconds, total, covered
 
 
 def main() -> int:
@@ -209,14 +257,13 @@ def main() -> int:
     count = 0
     pilot_seconds = 0.0
     sink = a.output.open("w", encoding="utf-8") if a.output else sys.stdout
+    state = {}
     try:
         with sf.SoundFile(a.input) as scanner, sf.SoundFile(a.input) as pilot_source:
-            first = min(scanner.frames, round(a.start * rate))
-            last = (scanner.frames if a.duration is None else
-                    min(scanner.frames, first + round(a.duration * rate)))
-            covered = (last - first) / rate
+            first = round(a.start * rate)
             for preamble, postamble in iter_preamble_pairs(
-                    scanner, rate, a.system, a.start, a.duration, a.threshold):
+                    scanner, rate, a.system, a.start, a.duration, a.threshold,
+                    state=state):
                 pilot_started = perf_counter()
                 label, confidence, scores = pilot_at(
                     pilot_source, preamble[0], rate, a.system)
@@ -238,9 +285,17 @@ def main() -> int:
         if a.output:
             sink.close()
     total = perf_counter() - started
+    covered = max(0, state.get("last_sample", first) - first) / rate
+    if state.get("read_error"):
+        label = ("EOF with unknown FLAC length" if state.get("expected_eof")
+                 else "FLAC decode stopped")
+        print(f"{label} near {covered:.3f}s: {state['read_error']}",
+              file=sys.stderr)
     print(f"input={covered:.3f}s tracks={count} "
           f"preamble_scan={total-pilot_seconds:.3f}s pilot_scan={pilot_seconds:.3f}s "
           f"total={total:.3f}s", file=sys.stderr)
+    if state.get("read_error") and not state.get("expected_eof"):
+        return 3
     return 0 if count else 2
 
 

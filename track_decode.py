@@ -14,7 +14,7 @@ from cpu_backend import (CRC_BASE, CRC_CONTRIBUTIONS, filter_samples,
                          scan_window)
 from pcm_core import BLOCK_BITS, NTSC_BIT_RATE, Block, crc16_video8
 from timed import FIELD_PERIOD, NTSC_FIELD_BYTES, Field, write_field, write_header
-from v8markers import iter_preamble_pairs
+from v8markers import iter_preamble_pairs, read_window
 from video8pcm import _deduplicate, _keep_sequences
 
 
@@ -141,14 +141,17 @@ def demodulate_tracks(path: Path, output: Path, rate: float, start: float,
     started = perf_counter()
     first = round(start * rate)
     last_report = -1
+    scan_state = {}
+    track_error = None
 
     def progress(done: int, last: int) -> None:
         nonlocal last_report
         processed = int((done - first) / rate)
         if processed > last_report:
             last_report = processed
-            print(f'\rscan+decode {min(done, last) / rate:.1f}s/'
-                  f'{last / rate:.1f}s tracks={completed}/{index}', end='',
+            total = f'{last / rate:.1f}s' if last is not None else '?'
+            print(f'\rscan+decode {done / rate:.1f}s/'
+                  f'{total} tracks={completed}/{index}', end='',
                   file=sys.stderr, flush=True)
 
     def write_result(peak, result, sink):
@@ -187,23 +190,37 @@ def demodulate_tracks(path: Path, output: Path, rate: float, start: float,
         pending = deque()
         for index, (preamble, _postamble) in enumerate(
                 iter_preamble_pairs(scanner, rate, 'ntsc', start, duration,
-                                    20.0, progress), 1):
+                                    20.0, progress, scan_state), 1):
             peak = preamble[0]
             left = max(0, round(peak - .00025 * rate))
             right = min(source.frames, round(peak + .0031 * rate))
-            source.seek(left)
-            samples = source.read(right - left, dtype='float32')
-            pending.append((peak, pool.submit(
-                decode_track, samples, left, peak, rate, phases)))
+            samples, error = read_window(source, left, right)
+            if error is not None:
+                track_error = error
+            result = (pool.submit(decode_track, samples, left, peak, rate, phases)
+                      if len(samples) == right - left else None)
+            pending.append((peak, result))
             if len(pending) >= workers * 2:
                 oldest_peak, future = pending.popleft()
-                write_result(oldest_peak, future.result(), sink)
+                write_result(oldest_peak, future.result() if future is not None
+                             else None, sink)
         while pending:
             oldest_peak, future = pending.popleft()
-            write_result(oldest_peak, future.result(), sink)
+            write_result(oldest_peak, future.result() if future is not None
+                         else None, sink)
     print(file=sys.stderr)
     print(f'markers={index} elapsed={perf_counter() - started:.3f}s '
           f'workers={workers}', file=sys.stderr)
+    read_error = scan_state.get("read_error") or track_error
+    expected_eof = scan_state.get("expected_eof", False) and track_error is None
+    if read_error is not None:
+        at = scan_state.get("last_sample", 0) / rate
+        label = "EOF with unknown FLAC length" if expected_eof else "FLAC decode stopped"
+        print(f"{label} near {at:.3f}s: {read_error}", file=sys.stderr)
+        if not expected_eof:
+            print("The output contains the tracks decoded before this point. "
+                  "Check the source FLAC with 'flac -t'.", file=sys.stderr)
     if stats is not None:
-        stats.update(good=crc_good, bad=crc_bad, missing=missing_fields)
+        stats.update(good=crc_good, bad=crc_bad, missing=missing_fields,
+                     read_error=read_error, expected_eof=expected_eof)
     return written

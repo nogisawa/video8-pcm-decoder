@@ -111,6 +111,8 @@ def main():
     print(f"input CRC error rate: {error_rate(bad, good + bad)} "
           f"({bad}/{good + bad} blocks, missing_fields={missing})",
           file=sys.stderr)
+    if stats.get("read_error") and not stats.get("expected_eof"):
+        return 3
     return 0 if count else 2
 
 
